@@ -1,0 +1,8 @@
+<library path="joystick_aggregrator_controller">
+  <class
+    name="joystick_rviz_plugins/JoystickAggregatorPanel"
+    type="joystick_rviz_plugins::JoystickAggregatorPanel"
+    base_class_type="rviz_common::Panel">
+    <description>Edits joystick_aggregator axis and button parameters.</description>
+  </class>
+</library>
