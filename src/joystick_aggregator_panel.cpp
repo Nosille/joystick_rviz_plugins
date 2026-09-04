@@ -20,10 +20,15 @@ namespace joystick_rviz_plugins
 namespace
 {
 std::vector<std::string> parseJoystickValues(
-  const std::string & text, 
-  const std::string & property_key, 
+  const std::string & text,
+  const std::string & property_key,
   const std::string & topic_filter,
-  const std::string & list_key)
+  const std::string & list_key,
+  const std::string & host_filter = "",
+  const std::string & index_filter = "",
+  const std::string & name_filter = "",
+  const std::string & serial_filter = "",
+  const std::string & guid_filter = "")
 {
   std::vector<std::string> values;
   if (topic_filter.empty()) {
@@ -65,7 +70,17 @@ std::vector<std::string> parseJoystickValues(
       return value;
     };
 
-    if (parse_value("topic") == topic_filter) {
+    const auto matches_filter = [&parse_value](
+      const std::string & field, const std::string & filter) {
+        return filter.empty() || filter == "any" || parse_value(field) == filter;
+      };
+
+    if (parse_value("topic") == topic_filter &&
+      matches_filter("host", host_filter) &&
+      matches_filter("joy_index", index_filter) &&
+      matches_filter("joy_name", name_filter) &&
+      matches_filter("joy_serial", serial_filter) &&
+      matches_filter("joy_guid", guid_filter)) {
       if (property_key == "joy_label") {
         const size_t list_position = record.find(list_key + ":");
         if (list_position != std::string::npos) {
@@ -143,7 +158,7 @@ public:
 JoystickAggregatorPanel::JoystickAggregatorPanel()
 : property_root_(new rviz_common::properties::Property(
     "Joystick Aggregator", QVariant(), "Currently subscribed joystick topics")),
-  property_node_(nullptr), property_topics_(nullptr), 
+  property_node_(nullptr), property_topics_(nullptr),
   property_axes_(nullptr), property_buttons_(nullptr),
   property_model_(new rviz_common::properties::PropertyTreeModel(property_root_, this)),
   property_tree_(new rviz_common::properties::PropertyTreeWidget(this))
@@ -529,10 +544,19 @@ void JoystickAggregatorPanel::rebuildAxisProperties()
         auto * joystick_property = static_cast<rviz_common::properties::EditableEnumProperty *>(field_property);
         QObject::connect(
           joystick_property, &rviz_common::properties::EditableEnumProperty::requestOptions, this,
-          [this, joystick_property, topic_property, field]() {
+          [this, joystick_property, topic_property, field, axis_name]() {
             std::lock_guard<std::mutex> lock(mutex_);
+            const auto parameter_value = [this, &axis_name](const std::string & name) {
+              const auto value = axis_parameters_.find(axis_name + "." + name);
+              return value == axis_parameters_.end() ? std::string("any") : value->second;
+            };
             const auto values = parseJoystickValues(
-              joysticks_available_message_, field, topic_property->getStdString(), "axes");
+              joysticks_available_message_, field, topic_property->getStdString(), "axes",
+              field == "joy_label" ? parameter_value("joy_host") : "",
+              field == "joy_label" ? parameter_value("joy_index") : "",
+              field == "joy_label" ? parameter_value("joy_name") : "",
+              field == "joy_label" ? parameter_value("joy_serial") : "",
+              field == "joy_label" ? parameter_value("joy_guid") : "");
             joystick_property->clearOptions();
             if (field != "joy_label") {
               joystick_property->addOptionStd("any");
@@ -618,11 +642,20 @@ void JoystickAggregatorPanel::rebuildButtonProperties()
         auto * enum_property = static_cast<rviz_common::properties::EditableEnumProperty *>(field_property);
         QObject::connect(
           enum_property, &rviz_common::properties::EditableEnumProperty::requestOptions, this,
-          [this, enum_property, topic_property, field]() {
+          [this, enum_property, topic_property, field, button_name]() {
             std::lock_guard<std::mutex> lock(mutex_);
+            const auto parameter_value = [this, &button_name](const std::string & name) {
+              const auto value = button_parameters_.find(button_name + "." + name);
+              return value == button_parameters_.end() ? std::string("any") : value->second;
+            };
             const auto values = parseJoystickValues(
               joysticks_available_message_, field, topic_property->getStdString(),
-              field == "joy_label" ? "buttons" : "axes");
+              field == "joy_label" ? "buttons" : "axes",
+              field == "joy_label" ? parameter_value("joy_host") : "",
+              field == "joy_label" ? parameter_value("joy_index") : "",
+              field == "joy_label" ? parameter_value("joy_name") : "",
+              field == "joy_label" ? parameter_value("joy_serial") : "",
+              field == "joy_label" ? parameter_value("joy_guid") : "");
             enum_property->clearOptions();
             if (field != "joy_label") {
               enum_property->addOptionStd("any");
@@ -903,7 +936,7 @@ void JoystickAggregatorPanel::removeButton(size_t index)
     const std::string button_name = button_names_[index];
     button_names_.erase(button_names_.begin() + index);
     buttons = button_names_;
-    for (auto it = button_parameters_.begin(); it != button_parameters_.end();) {
+    for (auto it = button_parameters_.begin(); it != button_parameters_.end(); ) {
       if (it->first.rfind(button_name + ".", 0) == 0) {
         it = button_parameters_.erase(it);
       } else {
@@ -956,9 +989,6 @@ void JoystickAggregatorPanel::removeTopic(size_t index)
     refreshTopicOptions();
   }, Qt::QueuedConnection);
 }
-
-
-
 
 void JoystickAggregatorPanel::populateNamespaceOptions()
 {
