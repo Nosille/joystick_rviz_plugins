@@ -69,6 +69,7 @@ private:
   void topicSelectionChanged(rviz_common::properties::EditableEnumProperty * property);
   void parameterChanged(rviz_common::properties::StringProperty * property, const char * name);
   void loadParameters();
+  void saveParameters();
   void requestNodeParameters();
   std::vector<std::string> parseTopicList(const std::string & list_text);
 
@@ -85,6 +86,8 @@ private:
   rviz_common::properties::StringProperty * property_add_axis_;
   rviz_common::properties::Property * property_buttons_;
   rviz_common::properties::StringProperty * property_add_button_;
+  rviz_common::properties::BoolProperty * property_load_parameters_;
+  rviz_common::properties::BoolProperty * property_save_parameters_;
 
   rclcpp::AsyncParametersClient::SharedPtr parameters_client_;
   std::shared_ptr<rclcpp::ParameterEventHandler> parameter_event_handler_;

@@ -138,11 +138,7 @@ public:
     if (!initial_path.isEmpty()) {
       dialog->setDirectory(initial_path);
     }
-    // Accept a selected directory asynchronously so the editor closes cleanly.
-    QObject::connect(dialog, &QFileDialog::fileSelected, this, [this, dialog](const QString & path) {
-        setString(path);
-        QMetaObject::invokeMethod(dialog, "accept", Qt::QueuedConnection);
-    });
+    // Apply the directory only after the dialog is accepted.
     QObject::connect(dialog, &QFileDialog::accepted, this, [this, dialog]() {
         const QStringList selected = dialog->selectedFiles();
         if (!selected.isEmpty()) {
@@ -164,7 +160,8 @@ JoystickAggregatorPanel::JoystickAggregatorPanel()
   property_model_(new rviz_common::properties::PropertyTreeModel(property_root_, this)),
   property_tree_(new rviz_common::properties::PropertyTreeWidget(this)),
   property_node_(nullptr), property_topics_(nullptr),
-  property_axes_(nullptr), property_buttons_(nullptr)
+  property_axes_(nullptr), property_buttons_(nullptr),
+  property_load_parameters_(nullptr), property_save_parameters_(nullptr)
 {
   // Create the property tree and layout.
   property_tree_->setModel(property_model_);
@@ -192,7 +189,6 @@ JoystickAggregatorPanel::JoystickAggregatorPanel()
   QObject::connect(
     property_param_path_, &rviz_common::properties::StringProperty::changed, this,
     [this]() {
-      refreshParamFileOptions();
       parameterChanged(property_param_path_, "param_path");
     });
   QObject::connect(
@@ -201,19 +197,43 @@ JoystickAggregatorPanel::JoystickAggregatorPanel()
   QObject::connect(
     property_param_file_, &rviz_common::properties::StringProperty::changed, this,
     [this]() {
-      if (!parameters_client_ || updating_properties_) {
+      if (property_param_file_->getStdString().empty()) {
+        std::string previous_file;
+        {
+          std::lock_guard<std::mutex> lock(mutex_);
+          previous_file = param_file_;
+        }
+        if (!previous_file.empty()) {
+          const QSignalBlocker blocker(property_param_file_);
+          property_param_file_->setString(QString::fromStdString(previous_file));
+        }
         return;
       }
-      parameters_client_->set_parameters(
-        {rclcpp::Parameter("param_file", property_param_file_->getStdString())},
-        [this](const auto & result) {
-        const auto results = result.get();
-        const bool successful = std::all_of(
-            results.begin(), results.end(), [](const auto & item) {return item.successful;});
-        if (successful) {
-          QMetaObject::invokeMethod(this, [this]() {loadParameters();}, Qt::QueuedConnection);
-        }
-        });
+      parameterChanged(property_param_file_, "param_file");
+    });
+  property_load_parameters_ = new rviz_common::properties::BoolProperty(
+    "Load", false, "Load parameters from the selected parameter file", property_node_);
+  QObject::connect(
+    property_load_parameters_, &rviz_common::properties::BoolProperty::changed, this,
+    [this]() {
+      if (!property_load_parameters_->getBool()) {
+        return;
+      }
+      const QSignalBlocker blocker(property_load_parameters_);
+      property_load_parameters_->setBool(false);
+      loadParameters();
+    });
+  property_save_parameters_ = new rviz_common::properties::BoolProperty(
+    "Save", false, "Save the aggregator parameters to the selected parameter file", property_node_);
+  QObject::connect(
+    property_save_parameters_, &rviz_common::properties::BoolProperty::changed, this,
+    [this]() {
+      if (!property_save_parameters_->getBool()) {
+        return;
+      }
+      const QSignalBlocker blocker(property_save_parameters_);
+      property_save_parameters_->setBool(false);
+      saveParameters();
     });
 
   // Create the topics property that holds the list of currently subscribed joystick topics.
@@ -525,15 +545,47 @@ void JoystickAggregatorPanel::loadParameters()
     return;
   }
 
-  const auto client = node->create_client<std_srvs::srv::Trigger>(namespace_value + "/load_parameters");
+  const std::string service_name = namespace_value + "/load_parameters";
+  const auto client = node->create_client<std_srvs::srv::Trigger>(service_name);
+  RCLCPP_INFO(node->get_logger(), "Requesting parameter load from %s", service_name.c_str());
+  if (!client->service_is_ready()) {
+    RCLCPP_WARN(node->get_logger(), "Parameter load service is not available: %s", service_name.c_str());
+    return;
+  }
   auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
   client->async_send_request(
     request,
-    [this, client](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture result) {
-      if (result.get()->success) {
+    [this, client, node](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture result) {
+      const auto response = result.get();
+      if (response->success) {
+        RCLCPP_INFO(node->get_logger(), "Parameter load succeeded: %s", response->message.c_str());
         QTimer::singleShot(100, this, [this]() {requestNodeParameters();});
+      } else {
+        RCLCPP_ERROR(node->get_logger(), "Parameter load failed: %s", response->message.c_str());
       }
     });
+}
+
+void JoystickAggregatorPanel::saveParameters()
+{
+  if (!getDisplayContext()) {
+    return;
+  }
+
+  auto node = getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
+  std::string namespace_value = property_node_ ? property_node_->getStdString() : "";
+  while (!namespace_value.empty() && namespace_value.back() == '/') {
+    namespace_value.pop_back();
+  }
+  if (namespace_value.empty()) {
+    return;
+  }
+
+  const auto client = node->create_client<std_srvs::srv::Trigger>(namespace_value + "/save_parameters");
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  client->async_send_request(
+    request,
+    [client](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture) {});
 }
 
 void JoystickAggregatorPanel::refreshParamFileOptions()
@@ -563,7 +615,15 @@ void JoystickAggregatorPanel::refreshParamFileOptions()
 
 void JoystickAggregatorPanel::rebuildAxisProperties()
 {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::string> axis_names;
+  std::unordered_map<std::string, std::string> axis_parameters;
+  std::vector<std::string> topics_subscribed;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    axis_names = axis_names_;
+    axis_parameters = axis_parameters_;
+    topics_subscribed = topics_subscribed_;
+  }
   if (!property_axes_ || !property_add_axis_) {
     return;
   }
@@ -574,35 +634,35 @@ void JoystickAggregatorPanel::rebuildAxisProperties()
 
   const std::vector<std::string> fields{
     "topic", "joy_host", "joy_index", "joy_name", "joy_serial", "joy_guid", "joy_label"};
-  for (size_t index = 0; index < axis_names_.size(); ++index) {
-    const auto & axis_name = axis_names_[index];
+  for (size_t index = 0; index < axis_names.size(); ++index) {
+    const auto & axis_name = axis_names[index];
     auto * axis_property = new rviz_common::properties::Property(
       QString::fromStdString(axis_name), QVariant(), "Axis mapping", property_axes_);
     rviz_common::properties::EditableEnumProperty * topic_property = nullptr;
     for (const auto & field : fields) {
       const std::string parameter_name = axis_name + "." + field;
-      const auto value = axis_parameters_.find(parameter_name);
+      const auto value = axis_parameters.find(parameter_name);
       auto * field_property = field == "topic" || field == "joy_host" ||
         field == "joy_index" || field == "joy_name" || field == "joy_serial" ||
         field == "joy_guid" || field == "joy_label" ?
         new rviz_common::properties::EditableEnumProperty(
           QString::fromStdString(field),
-          value == axis_parameters_.end() ? QString() : QString::fromStdString(value->second),
+          value == axis_parameters.end() ? QString() : QString::fromStdString(value->second),
           "Axis parameter", axis_property) :
         new rviz_common::properties::StringProperty(
           QString::fromStdString(field),
-          value == axis_parameters_.end() ? QString() : QString::fromStdString(value->second),
+          value == axis_parameters.end() ? QString() : QString::fromStdString(value->second),
           "Axis parameter", axis_property);
       if (field == "topic") {
         // Topic choices are limited to topics currently subscribed by the aggregator.
         topic_property = static_cast<rviz_common::properties::EditableEnumProperty *>(field_property);
         topic_property->clearOptions();
-        for (const auto & topic : topics_subscribed_) {
+        for (const auto & topic : topics_subscribed) {
           topic_property->addOptionStd(topic);
         }
-        const std::string current_value = value == axis_parameters_.end() ? std::string() : value->second;
-        if (!current_value.empty() && std::find(topics_subscribed_.begin(), topics_subscribed_.end(),
-            current_value) == topics_subscribed_.end()) {
+        const std::string current_value = value == axis_parameters.end() ? std::string() : value->second;
+        if (!current_value.empty() && std::find(topics_subscribed.begin(), topics_subscribed.end(),
+          current_value) == topics_subscribed.end()) {
           topic_property->addOptionStd(current_value);
         }
         topic_property->sortOptions();
@@ -675,7 +735,15 @@ void JoystickAggregatorPanel::rebuildAxisProperties()
 
 void JoystickAggregatorPanel::rebuildButtonProperties()
 {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::string> button_names;
+  std::unordered_map<std::string, std::string> button_parameters;
+  std::vector<std::string> topics_subscribed;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    button_names = button_names_;
+    button_parameters = button_parameters_;
+    topics_subscribed = topics_subscribed_;
+  }
   if (!property_buttons_ || !property_add_button_) {
     return;
   }
@@ -685,30 +753,30 @@ void JoystickAggregatorPanel::rebuildButtonProperties()
   // Button fields mirror axes and add the configurable minimum threshold.
   const std::vector<std::string> fields{
     "topic", "joy_host", "joy_index", "joy_name", "joy_serial", "joy_guid", "joy_label", "joy_min"};
-  for (size_t index = 0; index < button_names_.size(); ++index) {
-    const auto & button_name = button_names_[index];
+  for (size_t index = 0; index < button_names.size(); ++index) {
+    const auto & button_name = button_names[index];
     auto * button_property = new rviz_common::properties::Property(
       QString::fromStdString(button_name), QVariant(), "Button mapping", property_buttons_);
     rviz_common::properties::EditableEnumProperty * topic_property = nullptr;
     for (const auto & field : fields) {
       const std::string parameter_name = button_name + "." + field;
-      const auto value = button_parameters_.find(parameter_name);
+      const auto value = button_parameters.find(parameter_name);
       const bool enum_field = field == "topic" || field == "joy_host" || field == "joy_index" ||
         field == "joy_name" || field == "joy_serial" || field == "joy_guid" || field == "joy_label";
       auto * field_property = enum_field ?
         static_cast<rviz_common::properties::StringProperty *>(new rviz_common::properties::EditableEnumProperty(
           QString::fromStdString(field),
-          value == button_parameters_.end() ? QString() : QString::fromStdString(value->second),
+          value == button_parameters.end() ? QString() : QString::fromStdString(value->second),
           "Button parameter", button_property)) :
         new rviz_common::properties::StringProperty(
           QString::fromStdString(field),
-          value == button_parameters_.end() ? QString() : QString::fromStdString(value->second),
+          value == button_parameters.end() ? QString() : QString::fromStdString(value->second),
           "Button parameter", button_property);
       if (field == "topic") {
         // Topic choices are limited to topics currently subscribed by the aggregator.
         topic_property = static_cast<rviz_common::properties::EditableEnumProperty *>(field_property);
         topic_property->clearOptions();
-        for (const auto & topic : topics_subscribed_) {
+        for (const auto & topic : topics_subscribed) {
           topic_property->addOptionStd(topic);
         }
         topic_property->sortOptions();
@@ -893,24 +961,30 @@ void JoystickAggregatorPanel::requestNodeParameters()
 
 void JoystickAggregatorPanel::rebuildTopicListProperties()
 {
-  std::lock_guard<std::mutex> lock(mutex_);
+  std::vector<std::string> topics_selected;
+  std::vector<std::string> topics_available;
+  {
+    std::lock_guard<std::mutex> lock(mutex_);
+    topics_selected = topics_selected_;
+    topics_available = topics_available_;
+  }
   property_topics_->removeChildren(1);
   property_subscribed_topics_.clear();
   property_remove_topics_.clear();
 
-  for (size_t index = 0; index < topics_selected_.size(); ++index) {
-    const auto & topic = topics_selected_[index];
+  for (size_t index = 0; index < topics_selected.size(); ++index) {
+    const auto & topic = topics_selected[index];
     auto * property = new rviz_common::properties::EditableEnumProperty(
       QString::fromStdString("Topic " + std::to_string(index)),
       QString::fromStdString(topic),
       "Currently subscribed topic",
       property_topics_);
 
-    for (const auto & available_topic : topics_available_) {
+    for (const auto & available_topic : topics_available) {
       property->addOptionStd(available_topic);
     }
     property->addOptionStd("any");
-    if (std::find(topics_available_.begin(), topics_available_.end(), topic) == topics_available_.end()) {
+    if (std::find(topics_available.begin(), topics_available.end(), topic) == topics_available.end()) {
       property->addOptionStd(topic);
     }
     property->sortOptions();
