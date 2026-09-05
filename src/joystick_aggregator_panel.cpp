@@ -200,7 +200,21 @@ JoystickAggregatorPanel::JoystickAggregatorPanel()
     [this]() {refreshParamFileOptions();});
   QObject::connect(
     property_param_file_, &rviz_common::properties::StringProperty::changed, this,
-    [this]() {parameterChanged(property_param_file_, "param_file");});
+    [this]() {
+      if (!parameters_client_ || updating_properties_) {
+        return;
+      }
+      parameters_client_->set_parameters(
+        {rclcpp::Parameter("param_file", property_param_file_->getStdString())},
+        [this](const auto & result) {
+        const auto results = result.get();
+        const bool successful = std::all_of(
+            results.begin(), results.end(), [](const auto & item) {return item.successful;});
+        if (successful) {
+          QMetaObject::invokeMethod(this, [this]() {loadParameters();}, Qt::QueuedConnection);
+        }
+        });
+    });
 
   // Create the topics property that holds the list of currently subscribed joystick topics.
   property_topics_ = new rviz_common::properties::Property(
@@ -496,6 +510,32 @@ void JoystickAggregatorPanel::parameterChanged(
   parameters_client_->set_parameters({rclcpp::Parameter(name, property->getStdString())});
 }
 
+void JoystickAggregatorPanel::loadParameters()
+{
+  if (!getDisplayContext()) {
+    return;
+  }
+
+  auto node = getDisplayContext()->getRosNodeAbstraction().lock()->get_raw_node();
+  std::string namespace_value = property_node_ ? property_node_->getStdString() : "";
+  while (!namespace_value.empty() && namespace_value.back() == '/') {
+    namespace_value.pop_back();
+  }
+  if (namespace_value.empty()) {
+    return;
+  }
+
+  const auto client = node->create_client<std_srvs::srv::Trigger>(namespace_value + "/load_parameters");
+  auto request = std::make_shared<std_srvs::srv::Trigger::Request>();
+  client->async_send_request(
+    request,
+    [this, client](rclcpp::Client<std_srvs::srv::Trigger>::SharedFuture result) {
+      if (result.get()->success) {
+        QTimer::singleShot(100, this, [this]() {requestNodeParameters();});
+      }
+    });
+}
+
 void JoystickAggregatorPanel::refreshParamFileOptions()
 {
   if (!property_param_file_ || !property_param_path_) {
@@ -784,6 +824,8 @@ void JoystickAggregatorPanel::joysticksAvailableCallback(
 void JoystickAggregatorPanel::updateNode()
 {
   // Tear down clients and cached dynamic state before connecting to a new node.
+  parameter_event_callback_.reset();
+  parameter_event_handler_.reset();
   parameters_client_.reset();
   sub_topic_available_.reset();
   sub_topic_subscribed_.reset();
@@ -813,9 +855,14 @@ void JoystickAggregatorPanel::updateNode()
 
   parameters_client_ = std::make_shared<rclcpp::AsyncParametersClient>(node, namespace_value);
   // Load fixed lists first; their callbacks request the dynamic child parameters.
-  parameters_client_->get_parameters(
-    {"topics", "param_path", "param_file", "axes", "buttons"},
-    std::bind(&JoystickAggregatorPanel::parametersCallback, this, std::placeholders::_1));
+  requestNodeParameters();
+  parameter_event_handler_ = std::make_shared<rclcpp::ParameterEventHandler>(node);
+  parameter_event_callback_ = parameter_event_handler_->add_parameter_event_callback(
+    [this, namespace_value](const rcl_interfaces::msg::ParameterEvent & event) {
+      if (event.node == namespace_value && parameters_client_) {
+        requestNodeParameters();
+      }
+    });
 
   const std::string available_topic = namespace_value + "/topics_available";
   const std::string subscribed_topic = namespace_value + "/topics_subscribed";
@@ -831,6 +878,17 @@ void JoystickAggregatorPanel::updateNode()
   sub_joysticks_available_ = node->create_subscription<std_msgs::msg::String>(
     joysticks_available_topic, rclcpp::SensorDataQoS(),
     std::bind(&JoystickAggregatorPanel::joysticksAvailableCallback, this, std::placeholders::_1));
+}
+
+void JoystickAggregatorPanel::requestNodeParameters()
+{
+  if (!parameters_client_) {
+    return;
+  }
+
+  parameters_client_->get_parameters(
+    {"topics", "param_path", "param_file", "axes", "buttons"},
+    std::bind(&JoystickAggregatorPanel::parametersCallback, this, std::placeholders::_1));
 }
 
 void JoystickAggregatorPanel::rebuildTopicListProperties()

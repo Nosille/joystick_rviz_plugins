@@ -10,6 +10,7 @@
 #include <QTimer>
 #include <QVBoxLayout>
 #include <rclcpp/parameter_client.hpp>
+#include <rclcpp/parameter_event_handler.hpp>
 #include <rclcpp/subscription.hpp>
 #include <rviz_common/panel.hpp>
 #include <rviz_common/properties/editable_enum_property.hpp>
@@ -20,6 +21,7 @@
 #include <rviz_common/properties/property_tree_widget.hpp>
 #include <rviz_common/properties/string_property.hpp>
 #include <std_msgs/msg/string.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 namespace joystick_rviz_plugins
 {
@@ -66,9 +68,13 @@ private:
   void removeTopic(size_t index);
   void topicSelectionChanged(rviz_common::properties::EditableEnumProperty * property);
   void parameterChanged(rviz_common::properties::StringProperty * property, const char * name);
+  void loadParameters();
+  void requestNodeParameters();
   std::vector<std::string> parseTopicList(const std::string & list_text);
 
   rviz_common::properties::Property * property_root_;
+  rviz_common::properties::PropertyTreeModel * property_model_;
+  rviz_common::properties::PropertyTreeWidget * property_tree_;
   rviz_common::properties::EditableEnumProperty * property_node_;
   rviz_common::properties::FilePickerProperty * property_param_path_;
   rviz_common::properties::EditableEnumProperty * property_param_file_;
@@ -81,11 +87,11 @@ private:
   rviz_common::properties::StringProperty * property_add_button_;
 
   rclcpp::AsyncParametersClient::SharedPtr parameters_client_;
+  std::shared_ptr<rclcpp::ParameterEventHandler> parameter_event_handler_;
+  rclcpp::ParameterEventCallbackHandle::SharedPtr parameter_event_callback_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_topic_available_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_topic_subscribed_;
   rclcpp::Subscription<std_msgs::msg::String>::SharedPtr sub_joysticks_available_;
-  rviz_common::properties::PropertyTreeModel * property_model_;
-  rviz_common::properties::PropertyTreeWidget * property_tree_;
 
   std::mutex mutex_;
   std::vector<std::string> topics_selected_;

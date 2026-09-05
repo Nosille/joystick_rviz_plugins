@@ -11,6 +11,7 @@ find_package(rclcpp REQUIRED)
 find_package(pluginlib REQUIRED)
 find_package(rviz_common REQUIRED)
 find_package(sensor_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 set(CMAKE_AUTOMOC ON)
 set(PLUGIN_LIBRARY joystick_aggregrator_controller)
@@ -30,6 +31,7 @@ target_link_libraries(${PLUGIN_LIBRARY}
   pluginlib::pluginlib
   rviz_common::rviz_common
   ${sensor_msgs_TARGETS}
+  ${std_srvs_TARGETS}
 )
 
 pluginlib_export_plugin_description_file(rviz_common plugin_description.xml)
